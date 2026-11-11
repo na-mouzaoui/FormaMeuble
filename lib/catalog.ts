@@ -778,10 +778,12 @@ const CARCASS_TYPES: PartType[] = ['panel', 'shelf', 'rail', 'plinth', 'niche']
  * - aligne portes et tiroirs sur la façade du caisson ;
  * - repose les pieds au sol et recentre le modèle.
  */
-export function autoFitParts(parts: FurniturePart[]): AutoFitResult {
+export function autoFitParts(parts: FurniturePart[], reference: FurniturePart[] = []): AutoFitResult {
   if (!parts.length) return { parts, report: [] }
 
   const report: string[] = []
+  const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
+  const refById = new Map<string, FurniturePart>(reference.map((part) => [part.id, part] as const))
   let next = parts.map((part) => ({ ...part }))
 
   let snapped = 0
@@ -799,7 +801,7 @@ export function autoFitParts(parts: FurniturePart[]): AutoFitResult {
     }
     return part
   })
-  if (snapped > 0) report.push('Dimensions et positions arrondies au millimètre')
+  if (snapped > 0) report.push(`${snapped} dimension(s) ou position(s) arrondies au millimètre`)
 
   let thicknesses = 0
   next = next.map((part) => {
@@ -815,64 +817,208 @@ export function autoFitParts(parts: FurniturePart[]): AutoFitResult {
     }
     return part
   })
-  if (thicknesses > 0) report.push('Épaisseurs alignées sur les standards matière')
+  if (thicknesses > 0) report.push(`${thicknesses} épaisseur(s) alignée(s) sur les standards matière`)
+
+  let realigned = 0
+  next = next.map((part) => {
+    const ref = refById.get(part.id)
+    if (!ref) return part
+    if (part.x !== ref.x || part.y !== ref.y || part.z !== ref.z || (part.ry || 0) !== (ref.ry || 0)) {
+      realigned += 1
+      return { ...part, x: ref.x, y: ref.y, z: ref.z, ry: ref.ry }
+    }
+    return part
+  })
+  if (realigned > 0) report.push(`${realigned} composant(s) recalé(s) sur la structure`)
 
   const carcassParts = next.filter((part) => CARCASS_TYPES.includes(part.type))
   if (carcassParts.length) {
     const carcass = boundsOf(carcassParts)
+    const panelThicknesses = carcassParts.filter((part) => part.type === 'panel' || part.type === 'plinth').map((part) => part.thickness)
+    const sideT = panelThicknesses.length ? Math.max(2, ...panelThicknesses) : 18
+    const innerMinX = carcass.minX + sideT
+    const innerMaxX = carcass.maxX - sideT
+    const innerMinY = carcass.minY + sideT
+    const innerMaxY = carcass.maxY - sideT
+    const innerMinZ = carcass.minZ + sideT
+    const innerMaxZ = carcass.maxZ - sideT
+    const innerWidth = Math.max(40, innerMaxX - innerMinX)
+    const innerHeight = Math.max(40, innerMaxY - innerMinY)
+    const innerDepth = Math.max(40, innerMaxZ - innerMinZ)
+    const frontZ = carcass.maxZ
+    const margin = 3
 
+    // Étagères : on corrige les débordements sans casser les colonnes existantes.
     let shelves = 0
     next = next.map((part) => {
       if (part.type !== 'shelf') return part
-      // On ne touche pas aux tablettes qui forment le haut et le bas du caisson.
+      if (refById.has(part.id)) return part
       if (part.w >= carcass.width - 4) return part
-      const maxW = Math.max(40, carcass.width - 24)
-      const maxD = Math.max(40, carcass.depth - 20)
+      const maxW = Math.max(40, innerWidth - 2 * margin)
+      const maxD = Math.max(40, innerDepth - 2 * margin)
+      const halfColumn = part.w < innerWidth / 2
       const w = Math.min(part.w, maxW)
       const d = Math.min(part.d, maxD)
-      if (w !== part.w || d !== part.d) {
+      const x = halfColumn ? clamp(part.x, innerMinX + w / 2, innerMaxX - w / 2) : 0
+      const z = halfColumn ? clamp(part.z, innerMinZ + d / 2, innerMaxZ - d / 2) : 0
+      const y = clamp(part.y, innerMinY + part.h / 2, innerMaxY - part.h / 2)
+      if (w !== part.w || d !== part.d || Math.abs(x - part.x) > 0.5 || Math.abs(y - part.y) > 0.5 || Math.abs(z - part.z) > 0.5) {
         shelves += 1
-        return { ...part, w, d }
+        return { ...part, w, d, x, y, z }
       }
       return part
     })
-    if (shelves > 0) report.push('Étagères recadrées dans le caisson')
+    if (shelves > 0) report.push(`${shelves} étagère(s) recentrée(s) dans le caisson`)
 
-    let doors = 0
-    next = next.map((part) => {
-      if (part.type !== 'door') return part
-      const z = carcass.maxZ + 2 - part.d / 2
-      if (Math.abs(part.z - z) > 0.5) {
-        doors += 1
-        return { ...part, z }
+    // Portes : recadrage, alignement façade et répartition par rangée.
+    const doors = next.filter((part) => part.type === 'door' && !refById.has(part.id))
+    if (doors.length) {
+      const rows = new Map<number, FurniturePart[]>()
+      for (const door of doors) {
+        const key = Math.round(door.y / 20)
+        const row = rows.get(key) ?? []
+        row.push(door)
+        rows.set(key, row)
       }
-      return part
-    })
-    if (doors > 0) report.push('Portes alignées sur la façade')
+      let changed = 0
+      const fittedDoors = new Map<string, FurniturePart>()
+      for (const row of rows.values()) {
+        const sorted = [...row].sort((a, b) => a.x - b.x)
+        const maxW = Math.max(40, innerWidth - 2 * margin)
+        const maxH = Math.max(40, innerHeight - 2 * margin)
+        for (const door of sorted) {
+          const w = Math.min(door.w, maxW)
+          const h = Math.min(door.h, maxH)
+          const y = clamp(door.y, innerMinY + h / 2, innerMaxY - h / 2)
+          const z = frontZ + 2 - door.d / 2
+          const single = sorted.length === 1
+          const fitted: FurniturePart = { ...door, w, h, y, z, x: single ? 0 : door.x }
+          fittedDoors.set(door.id, fitted)
+        }
+        if (sorted.length > 1 && sorted.every((door) => door.leaves !== 2)) {
+          const totalWidth = sorted.reduce((sum, door) => sum + Math.min(door.w, maxW), 0)
+          const gap = 3
+          const groupWidth = totalWidth + gap * (sorted.length - 1)
+          let cursor = -groupWidth / 2
+          for (const door of sorted) {
+            const fitted = fittedDoors.get(door.id)!
+            fitted.x = cursor + fitted.w / 2
+            cursor += fitted.w + gap
+          }
+        }
+      }
+      next = next.map((part) => {
+        const fitted = fittedDoors.get(part.id)
+        if (!fitted) return part
+        if (
+          Math.abs(fitted.x - part.x) > 0.5 ||
+          Math.abs(fitted.y - part.y) > 0.5 ||
+          Math.abs(fitted.z - part.z) > 0.5 ||
+          fitted.w !== part.w ||
+          fitted.h !== part.h
+        ) {
+          changed += 1
+        }
+        return fitted
+      })
+      if (changed > 0) report.push(`${changed} porte(s) recentrée(s) sur la façade`)
+    }
 
-    let drawers = 0
-    next = next.map((part) => {
-      if (part.type !== 'drawer') return part
-      const z = carcass.maxZ - 4
-      if (Math.abs(part.z - z) > 0.5) {
-        drawers += 1
-        return { ...part, z }
+    // Tiroirs : largeur, façade et répartition verticale par colonne.
+    const drawers = next.filter((part) => part.type === 'drawer' && !refById.has(part.id))
+    if (drawers.length) {
+      const columns = new Map<number, FurniturePart[]>()
+      for (const drawer of drawers) {
+        const key = Math.round(drawer.x / 50)
+        const column = columns.get(key) ?? []
+        column.push(drawer)
+        columns.set(key, column)
       }
-      return part
-    })
-    if (drawers > 0) report.push('Tiroirs alignés sur la façade')
+      let changed = 0
+      const fittedDrawers = new Map<string, FurniturePart>()
+      for (const column of columns.values()) {
+        const sorted = [...column].sort((a, b) => a.y - b.y)
+        const maxW = Math.max(40, innerWidth - 2 * margin)
+        const maxH = Math.max(40, innerHeight - 2 * margin)
+        const singleColumn = columns.size === 1
+        const spanMin = Math.min(...sorted.map((drawer) => drawer.y - drawer.h / 2))
+        const spanMax = Math.max(...sorted.map((drawer) => drawer.y + drawer.h / 2))
+        const gap = 8
+        const available = Math.max(20, spanMax - spanMin - gap * (sorted.length - 1))
+        const height = sorted.length > 1 ? Math.min(maxH, available / sorted.length) : Math.min(sorted[0].h, maxH)
+        let cursor = sorted.length > 1 ? clamp(spanMin, innerMinY, innerMaxY - height * sorted.length - gap * (sorted.length - 1)) : sorted[0].y - height / 2
+        for (const drawer of sorted) {
+          const w = Math.min(drawer.w, maxW)
+          const y = sorted.length > 1 ? cursor + height / 2 : clamp(drawer.y, innerMinY + height / 2, innerMaxY - height / 2)
+          const fitted: FurniturePart = {
+            ...drawer,
+            w,
+            h: height,
+            x: singleColumn ? 0 : clamp(drawer.x, innerMinX + w / 2, innerMaxX - w / 2),
+            y,
+            z: frontZ - 4,
+          }
+          fittedDrawers.set(drawer.id, fitted)
+          if (sorted.length > 1) cursor += height + gap
+        }
+      }
+      next = next.map((part) => {
+        const fitted = fittedDrawers.get(part.id)
+        if (!fitted) return part
+        if (
+          Math.abs(fitted.x - part.x) > 0.5 ||
+          Math.abs(fitted.y - part.y) > 0.5 ||
+          Math.abs(fitted.z - part.z) > 0.5 ||
+          fitted.w !== part.w ||
+          fitted.h !== part.h
+        ) {
+          changed += 1
+        }
+        return fitted
+      })
+      if (changed > 0) report.push(`${changed} tiroir(s) réaligné(s) et réparti(s)`)
+    }
   }
 
+  // Pieds : au sol, et aux angles s'ils ont été déplacés.
+  const carcassForLegs = next.filter((part) => CARCASS_TYPES.includes(part.type))
+  const legBounds = carcassForLegs.length ? boundsOf(carcassForLegs) : null
   let legs = 0
   next = next.map((part) => {
     if (part.type !== 'leg') return part
-    if (Math.abs(part.y - part.h / 2) > 0.5) {
+    if (refById.has(part.id)) return part
+    let x = part.x
+    let z = part.z
+    const y = part.h / 2
+    if (legBounds) {
+      const inset = 45
+      const targets = [
+        { x: legBounds.minX + inset, z: legBounds.minZ + inset },
+        { x: legBounds.maxX - inset, z: legBounds.minZ + inset },
+        { x: legBounds.minX + inset, z: legBounds.maxZ - inset },
+        { x: legBounds.maxX - inset, z: legBounds.maxZ - inset },
+      ]
+      let best = targets[0]
+      let bestDistance = Infinity
+      for (const target of targets) {
+        const distance = Math.hypot(part.x - target.x, part.z - target.z)
+        if (distance < bestDistance) {
+          bestDistance = distance
+          best = target
+        }
+      }
+      if (bestDistance > 100) {
+        x = best.x
+        z = best.z
+      }
+    }
+    if (Math.abs(x - part.x) > 0.5 || Math.abs(y - part.y) > 0.5 || Math.abs(z - part.z) > 0.5) {
       legs += 1
-      return { ...part, y: part.h / 2 }
+      return { ...part, x, y, z }
     }
     return part
   })
-  if (legs > 0) report.push('Pieds reposés au sol')
+  if (legs > 0) report.push(`${legs} pied(s) repositionné(s) au sol et aux angles`)
 
   const bounds = boundsOf(next)
   const dx = Math.round(-bounds.cx)

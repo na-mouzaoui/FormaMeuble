@@ -570,39 +570,66 @@ export function Studio() {
     showToast('Récapitulatif téléchargé')
   }
 
-    const runAutoFit = (delay = 600) => {
+  const runAutoFit = (delay = 600) => {
     if (fitTimer.current) window.clearTimeout(fitTimer.current)
     setAdjusting(true)
     setFitReport([])
     fitTimer.current = window.setTimeout(() => {
       const report: string[] = []
+      const extraIds = new Set(extras.map((extra) => extra.id))
+
       if (templateKey) {
-        const result = autoFitParts(templateParts)
-        setTemplateParts(result.parts)
+        const result = autoFitParts(parts, templateParts)
+        const fittedBase = result.parts.filter((part) => !extraIds.has(part.id))
+        const fittedExtras = result.parts.filter((part) => extraIds.has(part.id))
+        setTemplateParts(fittedBase)
+        setExtras(fittedExtras)
+        setOverrides({})
         report.push(...result.report)
+        if (fittedExtras.length > 0) {
+          const overlaps = detectOverlaps(fittedExtras, fittedBase)
+          report.push(overlaps.length ? `${overlaps.length} chevauchement(s) détecté(s) sur les composants ajoutés` : 'Composants ajoutés sans chevauchement')
+        }
       } else {
         const normalized = normalizeCabinetParams(params)
+        const nextBase = buildCabinetParts(normalized.params)
+        const appliedBase = nextBase
+          .map((part) => (overrides[part.id] ? { ...part, ...overrides[part.id] } : part))
+          .filter((part) => !removed.includes(part.id))
+        const result = autoFitParts([...appliedBase, ...extras], nextBase)
+        const fittedBase = result.parts.filter((part) => !extraIds.has(part.id))
+        const fittedExtras = result.parts.filter((part) => extraIds.has(part.id))
+        const nextOverrides: Record<string, Partial<FurniturePart>> = {}
+        const keys = ['w', 'h', 'd', 'x', 'y', 'z', 'ry', 'thickness', 'color', 'material', 'handle', 'handleFinish', 'shape', 'cornerRadius', 'leaves', 'hinge', 'motion'] as const
+        for (const base of nextBase) {
+          const fitted = fittedBase.find((part) => part.id === base.id)
+          if (!fitted) continue
+          const patch: Partial<FurniturePart> = {}
+          for (const key of keys) {
+            if (JSON.stringify(fitted[key]) !== JSON.stringify(base[key])) {
+              ;(patch as Record<string, unknown>)[key] = fitted[key]
+            }
+          }
+          if (Object.keys(patch).length > 0) nextOverrides[base.id] = patch
+        }
         setParams(normalized.params)
-        report.push(...normalized.report)
-        const built = buildCabinetParts(normalized.params)
-        if (built.some((part) => part.type === 'door')) report.push('Jeux de façade vérifiés sur les portes')
-        if (built.some((part) => part.type === 'drawer')) report.push('Tiroirs alignés et coulissants')
-        if (built.some((part) => part.id.startsWith('base-shelf-'))) report.push('Étagères réparties dans le caisson')
-        report.push('Épaisseurs et jeux de fabrication conformes')
+        setOverrides(nextOverrides)
+        setExtras(fittedExtras)
+        report.push(...normalized.report, ...result.report)
+        if (fittedExtras.length > 0) {
+          const overlaps = detectOverlaps(fittedExtras, fittedBase)
+          report.push(overlaps.length ? `${overlaps.length} chevauchement(s) détecté(s) sur les composants ajoutés` : 'Composants ajoutés sans chevauchement')
+        }
       }
-      if (extras.length > 0) {
-        const others = allParts.filter((part) => !extras.some((extra) => extra.id === part.id))
-        const overlaps = detectOverlaps(extras, others)
-        report.push(overlaps.length ? `${overlaps.length} chevauchement(s) détecté(s) sur les composants ajoutés` : 'Composants ajoutés sans chevauchement')
-      }
-      if (report.length === 0) report.push('Aucun ajustement nécessaire : le meuble est déjà cohérent')
+
+      if (report.length === 0) report.push('Aucun décalage détecté : le meuble est déjà aligné')
       setFitReport(Array.from(new Set(report)))
       setAdjusting(false)
       setFitToken((value) => value + 1)
     }, delay)
   }
 
-const chooseTemplate = (key: string | null) => {
+  const chooseTemplate = (key: string | null) => {
     if (fitTimer.current) window.clearTimeout(fitTimer.current)
     setExtras([])
     setOverrides({})
